@@ -8,6 +8,66 @@ import re
 import shlex
 from vocabulary import vocabulary
 
+import xml.etree.ElementTree
+
+def normalize_story(story):
+    if story == None:
+        return None
+
+    story = ' '.join(story.split()).lower()
+
+    # Fix versions of say: say, .. say :, say " ", say ' ' => say ()
+    story = re.sub(
+        r'say\s*[:,]?\s*\(\s*([^\'"\(\)]+?)\s*\)([?.!])',
+        lambda m: f"say ({m.group(1)}){m.group(2)}",
+        story
+    )
+    story = re.sub(
+        r'say\s*[:,]?\s*([^\'"\(\)]+?)\s*([?.!])',
+        lambda m: f"say ({m.group(1)}){m.group(2)}",
+        story
+    )
+    story = re.sub(
+        r'say\s*[:,]?\s*\'\s*([^\'"]+?)\s*\'([?.!])',
+        lambda m: f"say ({m.group(1)}){m.group(2)}",
+        story
+    )
+    story = re.sub(
+        r'say\s*[:,]?\s*"\s*([^\'"]+?)\s*"([?.!])',
+        lambda m: f"say ({m.group(1)}){m.group(2)}",
+        story
+    )
+    return story
+
+
+def parse_xml_stories(xml_string):
+    """
+    Parse the given XML string of the form:
+    <stories>
+        <story summary="…">…</story>
+        …
+    </stories>
+    and return a list of dicts: [{"summary": str, "content": str}, …].
+    Whitespace in content is collapsed to single spaces.
+    """
+    m = re.match(r'<stories>.*</stories>',xml_string) 
+    if m:
+        xml_string = m.group(0)
+    
+    xml_stories = xml.etree.ElementTree.fromstring(xml_string)
+    stories = []
+    for xml_story in xml_stories.findall('story'):
+        summary = xml_story.get('summary', '')  # summary attribute
+        # Extract all inner text (including across newlines)
+        content = normalize_story(''.join(xml_story.itertext()))
+        if content != None:
+            stories.append({
+                'summary': summary,
+                'content': content
+            })
+    return stories
+
+
 class TrainingStoryteller:
     def __init__(self, args):
         self._args = args
@@ -15,9 +75,14 @@ class TrainingStoryteller:
         self._universe = None
         self._client = None
         self._base_messages = None
+        self._queue = []
+
     @property
     def num_stories(self):
         return int(self._args.get("num_stories", 1))
+    @property
+    def num_stories_per_imagine(self):
+        return int(self._args.get("num_stories_per_imagine", 1))
     @property
     def grammar_file(self):
         return str(self._args.get("grammar_file", "pidgin.md"))
@@ -109,38 +174,27 @@ class TrainingStoryteller:
             ]
         return self._base_messages
 
-    def unquote(self, s: str) -> str:
-        if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'") or (s[0] == '(' and s[-1] == ')')):
-            return s[1:-1]
-        return s
-    
-    def say(self, quote):
-        quote = self.unquote(quote)
-        if len(quote) > 1 and quote[-1] == '.':
-            quote = quote[0:-1]
-        return f"say ({quote})."
-
-    def normalize(self,story):
-        match = re.search(r'<sos>(.*?)<eos>', story, flags=re.DOTALL)
-        if not match:
-            return None
-        story = match.group(1)
-
-        story = ' '.join(story.split()).lower()
-
-        quote = lambda match: self.say(match.group(1))
-        story = re.sub(r'say\s*[:,]?\s*([^\'\(\)"?.!]+[?.!])', quote, story)
-        story = re.sub(r'say\s*[:,]?\s*"([^\'"]+)"', quote, story)
-        story = re.sub(r'say\s*[:,]?\s*\'([^\'"]+)\'', quote, story)
-        story = re.sub(r'say\s*[:,]?\s*\(([^\'"]+)\)', quote, story)
-
-        return story
-
     def tell(self):
+        if len(self._queue) == 0:
+            self.imagine()
+        story = self._queue[0]
+        self._queue = self._queue[1:]
+        return story
+    
+    @property
+    def prompt(self):
+        return f"""
+        Using the provided grammar, universe, and vocabulary, 
+        write about {self.num_stories_per_imagine} children's stories.
+        Respond with precisely the story as narrator, 
+        use the XML format <stories>...</stories> with each story in <story summary=\"English Summary\">...</story> tags.
+        """
+    
+    def imagine(self):
         client = self.client
         try:
             messages = self.base_messages + [
-                {"role": "user", "content": "Using the provided grammar, universe, and vocabulary, please write a short children's story.  Wrap the story in <sos> (start of sequence) and <eos> (end of sequence)"}
+                {"role": "user", "content": self.prompt }
             ]
             response = client.chat.completions.create(
                 model=self.model,
@@ -149,13 +203,10 @@ class TrainingStoryteller:
                 max_tokens=self.max_tokens,
                 stream=False
             )
-            story = response.choices[0].message.content
-            print(f"unnormalized: {story}")
-            print(f"quoted: {shlex.quote(story)}")
-            normalized = self.normalize(story)
-            print(f"normalized: {normalized}")
-            return normalized
-        
+            print(response)
+            xml_string = response.choices[0].message.content
+            imagined_stories = parse_xml_stories(xml_string)
+            self._queue += imagined_stories
         except Exception as e:
             # retry with GPT-3.5 if model not found
             err = getattr(e, 'error', {})
@@ -176,8 +227,8 @@ def main():
             print(model)
         return
 
-    if args.get("normalize",None) != None:
-        print(storyteller.normalize(args.get("normalize")))
+    if args.get("xml",None) != None:
+        print(parse_xml_stories(args.get("xml")))
         return
 
     for i in range(storyteller.num_stories):
